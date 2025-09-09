@@ -13,8 +13,16 @@
 #define LEDC_DUTY_RES LEDC_TIMER_14_BIT
 #define LEDC_FREQUENCY (50)
 
+#define PING_TIMEOUT 6000
+#define TRIG_HIGH_DELAY 10
+#define TRIG_LOW_DELAY 4
+#define TRIG_PIN 4
+#define ECHO_PIN 5
+
 #define true 1
 #define false 0
+
+static const char *tag = "MAIN";
 
 const int step = 13;
 const int min_duty = 409; // floor(0.001/0.02 * 2^14)
@@ -22,6 +30,13 @@ const int max_duty = 1966; // floor(0.002/0.02 * 2^14)
 int duty = min_duty;
 bool pos_direction = true;
 const int iteration_time = 10;
+
+
+
+typedef struct {
+    gpio_port_t echo_pin;
+    gpio_port_t trig_pin;
+} ultrasonic_sensor_t;
 
 /*
 Some things to try/consider:
@@ -86,8 +101,41 @@ void servo_step_task(void *args) { // will trigger a single step in the servo ev
     vTaskDelay(iteration_time / portTICK_PERIOD_MS);
 }
 
-void sensor_ping(void *args) {
-    printf("slime");
+void ultrasonic_init(const ultrasonic_sensor_t *dev) {
+
+}
+
+void sensor_ping_task(void *args) {
+    // later add some additional interrupt logic to block interrupts during sensor ping
+    ultrasonic_sensor_t sensor = {
+        .trig_pin = TRIG_PIN,
+        .echo_pin = ECHO_PIN
+    };
+
+    ultrasonic_sensor_t *sensor_ptr = &sensor;
+
+    gpio_set_level(sensor_ptr->trig_pin, 0);
+    ets_delay_us(TRIG_LOW_DELAY);
+    gpio_set_level(sensor_ptr->trig_pin,1);
+    ets_delay_us(TRIG_HIGH_DELAY);
+    gpio_set_level(sensor_ptr->trig_pin, 0);
+
+    if (gpio_get_level(sensor_ptr->echo_pin))
+        ESP_LOGE(tag, "ECHO already HIGH");
+
+    uint64_t start = esp_timer_get_time();
+    while (!gpio_get_level(sensor_ptr->echo_pin)) { // busy cycle until echo_pin HIGH
+        if (esp_timer_get_time()-start > PING_TIMEOUT)
+            ESP_LOGE(tag, "Sensor _Ping_ Timeout");
+    }
+
+    uint64_t echo_start = esp_timer_get_time();
+    while (gpio_get_level(sensor_ptr->echo_pin)) {
+        if (esp_timer_get_time()-start > PING_TIMEOUT)
+            ESP_LOGE(tag, "Sensor _Echo_ Timeout");
+    }
+
+
 }
 
 void app_main(void) {    
