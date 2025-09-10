@@ -16,8 +16,8 @@
 #define PING_TIMEOUT 6000
 #define TRIG_HIGH_DELAY 10
 #define TRIG_LOW_DELAY 4
-#define TRIG_PIN 4
-#define ECHO_PIN 5
+#define TRIG_PIN 5
+#define ECHO_PIN 4
 
 #define true 1
 #define false 0
@@ -102,44 +102,53 @@ void servo_step_task(void *args) { // will trigger a single step in the servo ev
 }
 
 void ultrasonic_init(const ultrasonic_sensor_t *dev) {
-
+    gpio_set_direction(dev->trig_pin, GPIO_MODE_OUTPUT);
+    gpio_set_direction(dev->echo_pin, GPIO_MODE_INPUT);
 }
 
-void sensor_ping_task(void *args) {
+void sensor_ping_task(ultrasonic_sensor_t *sensor,int64_t *time_us) {
     // later add some additional interrupt logic to block interrupts during sensor ping
+    gpio_set_level(sensor->trig_pin, 0);
+    ets_delay_us(TRIG_LOW_DELAY);
+    gpio_set_level(sensor->trig_pin,1);
+    ets_delay_us(TRIG_HIGH_DELAY);
+    gpio_set_level(sensor->trig_pin, 0);
+
+    if (gpio_get_level(sensor->echo_pin))
+        ESP_LOGE(tag, "ECHO already HIGH");
+
+    int64_t start = esp_timer_get_time();
+    while (!gpio_get_level(sensor->echo_pin)) { // busy cycle until echo_pin HIGH
+        if (esp_timer_get_time()-start > PING_TIMEOUT)
+            ESP_LOGE(tag, "Sensor _Ping_ Timeout");
+    }
+
+    int64_t echo_start = esp_timer_get_time();
+    int64_t time = echo_start;
+    while (gpio_get_level(sensor->echo_pin)) {
+        time = esp_timer_get_time();
+        if (esp_timer_get_time()-start > PING_TIMEOUT)
+            ESP_LOGE(tag, "Sensor _Echo_ Timeout");
+    }
+
+    *time_us = time-echo_start;
+}
+
+void app_main(void) {
+    ledc_setup();
+
     ultrasonic_sensor_t sensor = {
         .trig_pin = TRIG_PIN,
         .echo_pin = ECHO_PIN
     };
 
-    ultrasonic_sensor_t *sensor_ptr = &sensor;
+    ultrasonic_init(&sensor);
+    
+    int64_t roundtrip_time;
 
-    gpio_set_level(sensor_ptr->trig_pin, 0);
-    ets_delay_us(TRIG_LOW_DELAY);
-    gpio_set_level(sensor_ptr->trig_pin,1);
-    ets_delay_us(TRIG_HIGH_DELAY);
-    gpio_set_level(sensor_ptr->trig_pin, 0);
+    sensor_ping_task(&sensor, &roundtrip_time);
 
-    if (gpio_get_level(sensor_ptr->echo_pin))
-        ESP_LOGE(tag, "ECHO already HIGH");
+    int64_t distance = roundtrip_time/58.3;
 
-    uint64_t start = esp_timer_get_time();
-    while (!gpio_get_level(sensor_ptr->echo_pin)) { // busy cycle until echo_pin HIGH
-        if (esp_timer_get_time()-start > PING_TIMEOUT)
-            ESP_LOGE(tag, "Sensor _Ping_ Timeout");
-    }
-
-    uint64_t echo_start = esp_timer_get_time();
-    while (gpio_get_level(sensor_ptr->echo_pin)) {
-        if (esp_timer_get_time()-start > PING_TIMEOUT)
-            ESP_LOGE(tag, "Sensor _Echo_ Timeout");
-    }
-
-
-}
-
-void app_main(void) {    
-    ledc_setup();
-
-    xTaskCreate(&servo_loop_task, "servo_loop_task", 2048, NULL, 5, NULL);
+    xTaskCreate(&servo_step_task, "servo_ping_task", 2048, NULL, 5, NULL);
 }
