@@ -191,6 +191,27 @@ void write_to_oled_task(void *args) {
     printf("Finna write to the oled");
 }
 
+void bresenham_line(int8_t *line_buffer) {
+
+}
+
+void bresenham_semicircle(int8_t *semicircle_buffer) {
+    /*need to first create a semicircle equation. there are multiple strategies possible to populate the buffer with bytes corresponding to pixels
+    1) could iterate through pages, enumerate pages and keep a rolling count which is multiplied by 8 (bits per byte) to iterate through, which is then fed into the semicircle equation y = cy + sqrt(r^2 - (x-cx)^2) and is evaluated. 
+    - A bit math heavy, but will run with a for loop using a nested for loop which runs at a fixed range of 8 every single time, so runtime is O(9n) -> n = buffer size, sum of n buffer elements (main loop) + 8 * buffer elements (nested loop)
+
+    2) Could first iterate through the semicircle equation and store the coordinates for the semicircle in an array, then memcpy this coordinate array into the semicircle_buffer 
+    - O(n + k) -> n = semicircle_buffer size, k = coordinate_buffer size
+
+    coordinates could be stored in a hashmap, 
+
+    To correctly populate semicircle_buffer, bits need to be converted to bytes and represented in hex --> could make a for loop with a step size of 8 to properly iterate through semicircle_buffer and cheeck against 
+    */
+
+
+
+}
+
 void app_main(void) {
     static int64_t time;
     int64_t roundtrip_time;
