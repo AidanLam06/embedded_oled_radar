@@ -5,6 +5,7 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "driver/ledc.h"
+#include "freertos/queue.h"
 
 #define SERVO_CHANNEL LEDC_CHANNEL_0
 #define LEDC_MODE LEDC_LOW_SPEED_MODE
@@ -31,12 +32,25 @@ int duty = min_duty;
 bool pos_direction = true;
 const int iteration_time = 10;
 
-
+SemaphoreHandle_t servo_step;
+QueueHandle_t ultra_to_oled;
+static SemaphoreHandle_t echo_semaphore;
+static int64_t echo_start = 0;
+static int64_t echo_end = 0;
 
 typedef struct {
     gpio_port_t echo_pin;
     gpio_port_t trig_pin;
 } ultrasonic_sensor_t;
+
+typedef struct {
+    ultrasonic_sensor_t *sensor;
+    int64_t *time_us;
+} sensor_ping_task_args_t;
+
+typedef struct {
+    int distance;
+} scan_data_t;
 
 /*
 Some things to try/consider:
@@ -66,6 +80,28 @@ static void ledc_setup() {
     ledc_timer_config(&ledc_timer);
 }
 
+static void gpio_setup() {
+    gpio_config_t trig_config = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_OUTPUT,
+        .pin_bit_mask = (1ULL<<TRIG_PIN),
+        .pull_down_en = 0,
+        .pull_up_en = 0
+    };
+    gpio_config(&trig_config);
+
+    gpio_config_t echo_config = {
+        .intr_type = GPIO_INTR_ANYEDGE,
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL<<ECHO_PIN),
+        .pull_down_en = 0,
+        .pull_down_en = 0
+    };
+    gpio_config(&echo_config);
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(ECHO_PIN, echo_isr_handler, NULL);
+}
+
 void servo_loop_task(void *args) {
     int step = 15;
     int min_duty = 409; // for 14 bit resolution
@@ -89,16 +125,20 @@ void servo_loop_task(void *args) {
 }    
 
 void servo_step_task(void *args) { // will trigger a single step in the servo every time it is called. I think iteration time should be applied in the main loop.
-    if (pos_direction) duty += step;
-    else duty -= step;
+    for (;;) {
+        if (pos_direction) duty += step;
+        else duty -= step;
 
-    if (duty >= max_duty) pos_direction = false;
-    if (duty <= min_duty) pos_direction = true;
+        if (duty >= max_duty) pos_direction = false;
+        if (duty <= min_duty) pos_direction = true;
 
-    ledc_set_duty(LEDC_MODE, SERVO_CHANNEL, duty);
-    ledc_update_duty(LEDC_MODE, SERVO_CHANNEL);
+        ledc_set_duty(LEDC_MODE, SERVO_CHANNEL, duty);
+        ledc_update_duty(LEDC_MODE, SERVO_CHANNEL);
 
-    vTaskDelay(iteration_time / portTICK_PERIOD_MS);
+        xSemaphoreGive(servo_step);
+
+        vTaskDelay(iteration_time / portTICK_PERIOD_MS);
+    }
 }
 
 void ultrasonic_init(const ultrasonic_sensor_t *dev) {
@@ -106,49 +146,74 @@ void ultrasonic_init(const ultrasonic_sensor_t *dev) {
     gpio_set_direction(dev->echo_pin, GPIO_MODE_INPUT);
 }
 
-void sensor_ping_task(ultrasonic_sensor_t *sensor,int64_t *time_us) {
+static void IRAM_ATTR echo_isr_handler(void *args) {
+    int level = gpio_get_level(ECHO_PIN);
+    int64_t time_now = esp_timer_get_time();
+
+    if (level == 1) 
+        echo_start = time_now;
+    else {
+        echo_end = time_now;
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        xSemaphoreGiveFromISR(echo_semaphore, &xHigherPriorityTaskWoken);
+        if (xHigherPriorityTaskWoken) {
+            portYIELD_FROM_ISR();
+        }
+    }
+}
+
+void sensor_ping_task(void *pvParameters) {
     // later add some additional interrupt logic to block interrupts during sensor ping
-    gpio_set_level(sensor->trig_pin, 0);
-    ets_delay_us(TRIG_LOW_DELAY);
-    gpio_set_level(sensor->trig_pin,1);
-    ets_delay_us(TRIG_HIGH_DELAY);
-    gpio_set_level(sensor->trig_pin, 0);
 
-    if (gpio_get_level(sensor->echo_pin))
-        ESP_LOGE(tag, "ECHO already HIGH");
+    sensor_ping_task_args_t *args = (sensor_ping_task_args_t *)pvParameters;
+    ultrasonic_sensor_t *sensor = args->sensor;
+    int64_t *time_us = args->time_us;
 
-    int64_t start = esp_timer_get_time();
-    while (!gpio_get_level(sensor->echo_pin)) { // busy cycle until echo_pin HIGH
-        if (esp_timer_get_time()-start > PING_TIMEOUT)
-            ESP_LOGE(tag, "Sensor _Ping_ Timeout");
+    for (;;) {
+        if (xSemaphoreTake(servo_step, portMAX_DELAY)) {
+            
+            gpio_set_level(sensor->trig_pin, 0);
+            esp_rom_delay_us(TRIG_LOW_DELAY);
+            gpio_set_level(sensor->trig_pin,1);
+            esp_rom_delay_us(TRIG_HIGH_DELAY);
+            gpio_set_level(sensor->trig_pin, 0);
+
+            if (xSemaphoreTake(echo_semaphore, pdMS_TO_TICKS(PING_TIMEOUT))) {
+                int64_t duration = echo_end - echo_start;
+                ESP_LOGI(tag, "asd");
+                // add queue logic here for the ultra_to_oled queue, since this is the giver and the oled is the reciever
+            }
+        }   
     }
+}
 
-    int64_t echo_start = esp_timer_get_time();
-    int64_t time = echo_start;
-    while (gpio_get_level(sensor->echo_pin)) {
-        time = esp_timer_get_time();
-        if (esp_timer_get_time()-start > PING_TIMEOUT)
-            ESP_LOGE(tag, "Sensor _Echo_ Timeout");
-    }
-
-    *time_us = time-echo_start;
+void write_to_oled_task(void *args) {
+    printf("Finna write to the oled");
 }
 
 void app_main(void) {
-    ledc_setup();
+    static int64_t time;
+    int64_t roundtrip_time;
+    int64_t distance = roundtrip_time/58.3;
 
-    ultrasonic_sensor_t sensor = {
+    echo_semaphore = xSemaphoreCreateBinary();
+    servo_step = xSemaphoreCreateBinary();
+
+    static ultrasonic_sensor_t sensor = {
         .trig_pin = TRIG_PIN,
         .echo_pin = ECHO_PIN
     };
 
-    ultrasonic_init(&sensor);
+    static sensor_ping_task_args_t args = {
+        .sensor = &sensor,
+        .time_us = &time
+    };
     
-    int64_t roundtrip_time;
+    ledc_setup();
+    gpio_setup();
 
-    sensor_ping_task(&sensor, &roundtrip_time);
+    ultrasonic_init(&sensor);
 
-    int64_t distance = roundtrip_time/58.3;
-
-    xTaskCreate(&servo_step_task, "servo_ping_task", 2048, NULL, 5, NULL);
+    xTaskCreate(&servo_step_task, "servo_step_task", 2048, NULL, 5, NULL);
+    xTaskCreate(&sensor_ping_task, "sensor_ping_task", 2048, &args, 5, NULL);
 }
