@@ -6,6 +6,7 @@
 #include "esp_log.h"
 #include "driver/ledc.h"
 #include "freertos/queue.h"
+#include "driver/i2c.h"
 
 #define SERVO_CHANNEL LEDC_CHANNEL_0
 #define LEDC_MODE LEDC_LOW_SPEED_MODE
@@ -20,23 +21,32 @@
 #define TRIG_PIN 5
 #define ECHO_PIN 4
 
+#define I2C_NUM I2C_NUM_0
+#define I2C_MASTER_FREQ_HZ 800000
+
 #define true 1
 #define false 0
 
-static const char *tag = "MAIN";
+static const char *tag_main = "MAIN";
+static const char *tag_ssd1306 = "SSD1306";
 
-const int step = 13;
+const int step = 9;
 const int min_duty = 409; // floor(0.001/0.02 * 2^14)
 const int max_duty = 1966; // floor(0.002/0.02 * 2^14)
 int duty = min_duty;
 bool pos_direction = true;
-const int iteration_time = 10;
+int step_count = 0;
+const int iteration_time = 8;
+
+const int8_t i2c_address = 0x3C; //address on the oled pcb is 0x78 which translates to 0x3C if you shift one bit right 
 
 SemaphoreHandle_t servo_step;
 QueueHandle_t ultra_to_oled;
 static SemaphoreHandle_t echo_semaphore;
 static int64_t echo_start = 0;
 static int64_t echo_end = 0;
+
+
 
 typedef struct {
     gpio_port_t echo_pin;
@@ -52,12 +62,61 @@ typedef struct {
     int distance;
 } scan_data_t;
 
+typedef struct {
+        int x;
+        int y;
+    } pair_t;
+
+
+// precomputed lookup table for (x2,y2) pairs
+pair_t coord_lookup_table = {
+    {2,64}, {2,63}, {2,62}, {2,61}, {2,60}, {2,58}, {2,57}, {2,56}, {3,55}, {3,54}, {3,53}, 
+    {3,52}, {3,51}, {4,50}, {4,48}, {4,47}, {5,46}, {5,45}, {5,44}, {6,43}, {6,42}, {6,41}, 
+    {7,40}, {7,39}, {8,38}, {8,37}, {9,36}, {9,35}, {10,34}, {10,33}, {11,32}, {12,31}, 
+    {12,30}, {13,29}, {13,28}, {14,27}, {15,26}, {15,25}, {16,25}, {17,24}, {18,23}, {18,22}, 
+    {19,21}, {20,20}, {21,20}, {22,19}, {22,18}, {23,17}, {24,17}, {25,16}, {26,15}, {27,14}, 
+    {28,14}, {29,13}, {29,12}, {30,12}, {31,11}, {32,11}, {33,10}, {34,10}, {35,9}, {36,9}, 
+    {37,8}, {38,8}, {39,7}, {40,7}, {41,6}, {42,6}, {44,5}, {45,5}, {46,5}, {47,4}, {48,4}, 
+    {49,4}, {50,4}, {51,3}, {52,3}, {53,3}, {54,3}, {56,3}, {57,2}, {58,2}, {59,2}, {60,2}, 
+    {61,2}, {62,2}, {63,2}, {65,2}, {66,2}, {67,2}, {68,2}, {69,2}, {70,2}, {71,2}, {72,3}, 
+    {73,3}, {75,3}, {76,3}, {77,3}, {78,4}, {79,4}, {80,4}, {81,4}, {82,5}, {83,5}, {84,5}, 
+    {85,6}, {86,6}, {88,7}, {89,7}, {90,8}, {91,8}, {92,8}, {93,9}, {94,10}, {95,10}, {96,11}, 
+    {97,11}, {98,12}, {98,12}, {99,13}, {100,14}, {101,14}, {102,15}, {103,16}, {104,17}, 
+    {105,17}, {106,18}, {106,19}, {107,20}, {108,20}, {109,21}, {110,22}, {110,23}, {111,24}, 
+    {112,24}, {112,25}, {113,26}, {114,27}, {115,28}, {115,29}, {116,30}, {116,31}, {117,32}, 
+    {118,33}, {118,34}, {119,35}, {119,36}, {120,37}, {120,38}, {121,39}, {121,40}, {122,41}, 
+    {122,42}, {122,43}, {123,44}, {123,45}, {123,46}, {124,47}, {124,48}, {124,49}, {125,51}, 
+    {125,52}, {125,53}, {125,54}, {125,55}, {125,56}, {126,57}, {126,58}, {126,59}, {126,61}, 
+    {126,62}, {126,63}, {126,64}
+};
+
 /*
 Some things to try/consider:
 - make program activation to allow future use of a remote activation using some web page or something --> probably done by having a function that starts the program which can be called by a listening function
 - Buy an IR emitter that will allow an IR receiver to receive IR signals and move the motor using a remote --> Might have to buy another ESP32 for this since they are pretty cheap to make a remote, maybe even a cheap 3D printer to make a plastic remote body
 */
 
+// ====================================== ISR =======================================
+
+static void IRAM_ATTR echo_isr_handler(void *args) {
+    int level = gpio_get_level(ECHO_PIN);
+    int64_t time_now = esp_timer_get_time();
+
+    if (level == 1) 
+        echo_start = time_now;
+    else {
+        echo_end = time_now;
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        xSemaphoreGiveFromISR(echo_semaphore, &xHigherPriorityTaskWoken);
+        if (xHigherPriorityTaskWoken) {
+            portYIELD_FROM_ISR();
+        }
+    }
+}
+
+// ==================================================================================
+
+// ====================================== INIT ======================================
 static void ledc_setup() {
     ledc_channel_config_t ledc_channel = {
         .speed_mode = LEDC_MODE,
@@ -102,6 +161,68 @@ static void gpio_setup() {
     gpio_isr_handler_add(ECHO_PIN, echo_isr_handler, NULL);
 }
 
+static void i2c_master_init(int16_t sda, int16_t scl, int16_t reset) {
+    i2c_config_t i2c_config = {
+		.mode = I2C_MODE_MASTER,
+		.sda_io_num = sda,
+		.scl_io_num = scl,
+		.sda_pullup_en = GPIO_PULLUP_ENABLE,
+		.scl_pullup_en = GPIO_PULLUP_ENABLE,
+		.master.clk_speed = I2C_MASTER_FREQ_HZ
+	};
+	i2c_param_config(I2C_NUM, &i2c_config);
+	i2c_driver_install(I2C_NUM, I2C_MODE_MASTER, 0, 0, 0);
+}
+
+static void i2c_init(i2c_port_t i2c_num, uint8_t oled_address) {
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (oled_address << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, 0x00, true);  // Control byte: following are commands
+
+    i2c_master_write_byte(cmd, 0xAE, true); // Display OFF
+    i2c_master_write_byte(cmd, 0x20, true); // Set Memory Addressing Mode
+    i2c_master_write_byte(cmd, 0x02, true); // Page addressing mode
+    i2c_master_write_byte(cmd, 0xB0, true); // Set Page Start Address (Page 0)
+    i2c_master_write_byte(cmd, 0xC8, true); // COM Output Scan Direction remapped
+    i2c_master_write_byte(cmd, 0x00, true); // Low column address
+    i2c_master_write_byte(cmd, 0x10, true); // High column address
+    i2c_master_write_byte(cmd, 0x40, true); // Set Display Start Line
+    i2c_master_write_byte(cmd, 0x81, true); // Set Contrast
+    i2c_master_write_byte(cmd, 0x7F, true); //   (mid level)
+    i2c_master_write_byte(cmd, 0xA1, true); // Segment re-map
+    i2c_master_write_byte(cmd, 0xA6, true); // Normal display (not inverted)
+    i2c_master_write_byte(cmd, 0xA8, true); // Set multiplex ratio
+    i2c_master_write_byte(cmd, 0x3F, true); //   (1/64 duty for 128x64)
+    i2c_master_write_byte(cmd, 0xA4, true); // Resume display from RAM
+    i2c_master_write_byte(cmd, 0xD3, true); // Set display offset
+    i2c_master_write_byte(cmd, 0x00, true); //   no offset
+    i2c_master_write_byte(cmd, 0xD5, true); // Set display clock divide
+    i2c_master_write_byte(cmd, 0x80, true); //   suggested ratio
+    i2c_master_write_byte(cmd, 0xD9, true); // Set pre-charge
+    i2c_master_write_byte(cmd, 0xF1, true);
+    i2c_master_write_byte(cmd, 0xDA, true); // Set COM pins config
+    i2c_master_write_byte(cmd, 0x12, true);
+    i2c_master_write_byte(cmd, 0xDB, true); // Set VCOMH deselect
+    i2c_master_write_byte(cmd, 0x40, true);
+    i2c_master_write_byte(cmd, 0x8D, true); // Charge pump
+    i2c_master_write_byte(cmd, 0x14, true); //   enable
+    i2c_master_write_byte(cmd, 0xAF, true); // Display ON
+
+    i2c_master_stop(cmd);
+    i2c_master_cmd_begin(i2c_num, cmd, 10 / portTICK_PERIOD_MS);
+    i2c_cmd_link_delete(cmd);
+}
+
+void ultrasonic_init(const ultrasonic_sensor_t *dev) {
+    gpio_set_direction(dev->trig_pin, GPIO_MODE_OUTPUT);
+    gpio_set_direction(dev->echo_pin, GPIO_MODE_INPUT);
+}
+
+// ==================================================================================
+
+// ===================================== TASKS ======================================
 void servo_loop_task(void *args) {
     int step = 15;
     int min_duty = 409; // for 14 bit resolution
@@ -129,6 +250,9 @@ void servo_step_task(void *args) { // will trigger a single step in the servo ev
         if (pos_direction) duty += step;
         else duty -= step;
 
+        if (pos_direction) step_count++;
+        else step_count--;
+
         if (duty >= max_duty) pos_direction = false;
         if (duty <= min_duty) pos_direction = true;
 
@@ -141,30 +265,9 @@ void servo_step_task(void *args) { // will trigger a single step in the servo ev
     }
 }
 
-void ultrasonic_init(const ultrasonic_sensor_t *dev) {
-    gpio_set_direction(dev->trig_pin, GPIO_MODE_OUTPUT);
-    gpio_set_direction(dev->echo_pin, GPIO_MODE_INPUT);
-}
 
-static void IRAM_ATTR echo_isr_handler(void *args) {
-    int level = gpio_get_level(ECHO_PIN);
-    int64_t time_now = esp_timer_get_time();
-
-    if (level == 1) 
-        echo_start = time_now;
-    else {
-        echo_end = time_now;
-        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-        xSemaphoreGiveFromISR(echo_semaphore, &xHigherPriorityTaskWoken);
-        if (xHigherPriorityTaskWoken) {
-            portYIELD_FROM_ISR();
-        }
-    }
-}
 
 void sensor_ping_task(void *pvParameters) {
-    // later add some additional interrupt logic to block interrupts during sensor ping
-
     sensor_ping_task_args_t *args = (sensor_ping_task_args_t *)pvParameters;
     ultrasonic_sensor_t *sensor = args->sensor;
     int64_t *time_us = args->time_us;
@@ -180,37 +283,118 @@ void sensor_ping_task(void *pvParameters) {
 
             if (xSemaphoreTake(echo_semaphore, pdMS_TO_TICKS(PING_TIMEOUT))) {
                 int64_t duration = echo_end - echo_start;
-                ESP_LOGI(tag, "asd");
                 // add queue logic here for the ultra_to_oled queue, since this is the giver and the oled is the reciever
             }
         }   
     }
 }
 
+/*
+Outline of what needs to be written to the OLED:
+- the semicirlce, which will be initialized immediately
+- the line which moves with the current step of the servo --> the slope of the line is needed to make it, and since step is related to the duty cycle, we can use the duty 
+---> for (x2,y2) : 1966-409 = 1557 / 15 ~= 104 -> there will be 104 different segments of the 0 to 180 degree motion. Therefore if we want to find x2,y2 
+--> for the line, (x1,y1) will always be the circle centerpoint. 
+- the dots that will be placed onto the display once movement is detected at at step in the servo sweep cycle
+*/
+
 void write_to_oled_task(void *args) {
-    printf("Finna write to the oled");
+    /*
+    
+    */
+    printf("Finna write to the oled on dead homies");
 }
 
-void bresenham_line(int8_t *line_buffer) {
+// ===================================================================================
 
-}
-
-void bresenham_semicircle(int8_t *semicircle_buffer) {
-    /*need to first create a semicircle equation. there are multiple strategies possible to populate the buffer with bytes corresponding to pixels
-    1) could iterate through pages, enumerate pages and keep a rolling count which is multiplied by 8 (bits per byte) to iterate through, which is then fed into the semicircle equation y = cy + sqrt(r^2 - (x-cx)^2) and is evaluated. 
-    - A bit math heavy, but will run with a for loop using a nested for loop which runs at a fixed range of 8 every single time, so runtime is O(9n) -> n = buffer size, sum of n buffer elements (main loop) + 8 * buffer elements (nested loop)
-
-    2) Could first iterate through the semicircle equation and store the coordinates for the semicircle in an array, then memcpy this coordinate array into the semicircle_buffer 
-    - O(n + k) -> n = semicircle_buffer size, k = coordinate_buffer size
-
-    coordinates could be stored in a hashmap, 
-
-    To correctly populate semicircle_buffer, bits need to be converted to bytes and represented in hex --> could make a for loop with a step size of 8 to properly iterate through semicircle_buffer and cheeck against 
+// =================================== FUNCTIONS =====================================
+void draw_bresenham_line(int8_t *line_buffer, int x1, int x2, int y1, int y2) {
+    /*
+    For this line --> (x1,y1) would always be the centerpoint. (x2,y2) can be found using cosine {for x2} and sine {for y2}. the degrees per step is 1.04 if step size = 9. 
+    would be kind nice though to make a precomputer lookup table. Do this by running some code in python that generates these x2,y2 pairs and then just paste it into a new array at the top of this file  
+    also cosine and sine read radians in C so use | degrees*pi/180 | to convert to radians
     */
 
-
-
 }
+
+void draw_bresenham_semicircle(int8_t *semicircle_buffer) {
+    // I only need (-y,-x), (-x,-y), (x,-y), (y, -x) since I 1) only want half the circle 2) the origin (0,0) is at the top left of the screen and the max is at the bottom right so any shape meant to be plotted on a typical graph would be inverted
+
+    int cx = 64, cy = 64; // center will be (64,64)
+    int r = 62;
+    int x = 0, y = r;
+    int d = 3 - 2*r;
+    
+    while (x <= y) {
+        pair_t pairs[4] = {
+            {cx-y,cy-x},
+            {cx-x,cy-y},
+            {cx+x,cy-y},
+            {cx+y,cy-x}
+        };
+
+        for (int i = 0; i<4; i++) {
+            int px = pairs[i].x;
+            int py = pairs[i].y;
+
+            if (px<0 || px >= 128 || py < 0 || py >= 64) continue;
+
+            int page = py/8;
+            int bit = py%8;
+            int index = page*128 + px;
+            semicircle_buffer[index] |= (1<<bit);
+        }
+
+        if (d < 0) {
+            d += 4*x + 6;
+        } else {
+            d += 4*(x-y) + 10;
+            y--;
+        }
+        x++;
+    }
+}
+
+void ssd1306_write_page(i2c_port_t i2c_num, uint8_t addr, int page, int col, uint8_t *data, int len) {
+    i2c_cmd_handle_t cmd;
+
+    cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, 0x00, true); // command stream
+    i2c_master_write_byte(cmd, 0x00 | (col & 0x0F), true);
+    i2c_master_write_byte(cmd, 0x10 | (col >> 4), true);
+    i2c_master_write_byte(cmd, 0xB0 | page, true);
+    i2c_master_stop(cmd);
+    i2c_master_cmd_begin(i2c_num, cmd, 10 / portTICK_PERIOD_MS);
+    i2c_cmd_link_delete(cmd);
+
+    cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, 0x40, true); // data stream
+    i2c_master_write(cmd, data, len, true);
+    i2c_master_stop(cmd);
+    i2c_master_cmd_begin(i2c_num, cmd, 10 / portTICK_PERIOD_MS);
+    i2c_cmd_link_delete(cmd);
+}
+
+// ==================================================================================
+
+/* 
+The three structures used are
+1) servo_step semaphore --> servo steps, pushed an update to the semaphore and the ultrasonic sensor waits for it to ping
+2) echo_semaphore --> and ISR integrated binary semaphore which just acts as an interrupt handle call for when the echo pin goes HIGH. Easier on the CPU than busy cycling until echo goes HIGH.
+3) ultra_to_oled queue --> ultrasonic ping function pushes data to queue,
+You forgot to make the function that keeps track of the previous and current scans and checks whether they match or not. Will also need to write to the oled screen using dots, which should look like:
+  #
+# # #
+  #
+would also be nice to have the dots be written to the oled such that the distance is proportional on the display. So like if one movement detection is seen further away and another is seen closer, they should be at different radii from the center point
+This could probably be done by setting a max distance for movement detection. an initial scan routine for the ultrasonic sensor could set a boundary for disconsideration of changes by using the furthest object within some hard range limit (maybe like 1m or something) and
+scaling the movement flags on the display from that distance, which would be at the maximum of the semicircle ("radar")
+Would also need to wipe the display after displaying the movement for a second or two, maybe a reset at every change in direction for the servo might work. This might mean that changes on the edges of the servo rotation would only be seen for like a second though
+*/
 
 void app_main(void) {
     static int64_t time;
