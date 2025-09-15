@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
 #include "freertos/task.h"
@@ -27,6 +28,9 @@
 #define true 1
 #define false 0
 
+#define CENTER_X 64
+#define CENTER_Y 64
+
 static const char *tag_main = "MAIN";
 static const char *tag_ssd1306 = "SSD1306";
 
@@ -38,15 +42,19 @@ bool pos_direction = true;
 int step_count = 0;
 const int iteration_time = 8;
 
-const int8_t i2c_address = 0x3C; //address on the oled pcb is 0x78 which translates to 0x3C if you shift one bit right 
+const int8_t i2c_address = 0x3C; //address on the oled pcb is 0x78 which translates to 0x3C if you shift all the bits right by one bit
 
-SemaphoreHandle_t servo_step;
+SemaphoreHandle_t servo_to_ultra;
 QueueHandle_t ultra_to_oled;
+SemaphoreHandle_t oled_to_servo;
+
+
+// echo signal stuff
 static SemaphoreHandle_t echo_semaphore;
 static int64_t echo_start = 0;
 static int64_t echo_end = 0;
 
-
+int64_t distance_history[174];
 
 typedef struct {
     gpio_port_t echo_pin;
@@ -59,14 +67,9 @@ typedef struct {
 } sensor_ping_task_args_t;
 
 typedef struct {
-    int distance;
-} scan_data_t;
-
-typedef struct {
-        int x;
-        int y;
-    } pair_t;
-
+    int x;
+    int y;
+} pair_t;
 
 // precomputed lookup table for (x2,y2) pairs
 pair_t coord_lookup_table = {
@@ -90,14 +93,9 @@ pair_t coord_lookup_table = {
     {126,62}, {126,63}, {126,64}
 };
 
-/*
-Some things to try/consider:
-- make program activation to allow future use of a remote activation using some web page or something --> probably done by having a function that starts the program which can be called by a listening function
-- Buy an IR emitter that will allow an IR receiver to receive IR signals and move the motor using a remote --> Might have to buy another ESP32 for this since they are pretty cheap to make a remote, maybe even a cheap 3D printer to make a plastic remote body
-*/
-
 // ====================================== ISR =======================================
 
+// for the echo
 static void IRAM_ATTR echo_isr_handler(void *args) {
     int level = gpio_get_level(ECHO_PIN);
     int64_t time_now = esp_timer_get_time();
@@ -224,6 +222,7 @@ void ultrasonic_init(const ultrasonic_sensor_t *dev) {
 
 // ===================================== TASKS ======================================
 void servo_loop_task(void *args) {
+    // While this task is not useful for the final product of this program, it works, so keep it until debugging is complete
     int step = 15;
     int min_duty = 409; // for 14 bit resolution
     int max_duty = 1966; // for 14 bit resolution
@@ -246,26 +245,25 @@ void servo_loop_task(void *args) {
 }    
 
 void servo_step_task(void *args) { // will trigger a single step in the servo every time it is called. I think iteration time should be applied in the main loop.
-    for (;;) {
-        if (pos_direction) duty += step;
-        else duty -= step;
+    if (xSemaphoreTake(oled_to_servo, portMAX_DELAY))
+        for (;;) {
+            if (pos_direction) duty += step;
+            else duty -= step;
 
-        if (pos_direction) step_count++;
-        else step_count--;
+            if (pos_direction) step_count++;
+            else step_count--;
 
-        if (duty >= max_duty) pos_direction = false;
-        if (duty <= min_duty) pos_direction = true;
+            if (duty >= max_duty) pos_direction = false;
+            if (duty <= min_duty) pos_direction = true;
 
-        ledc_set_duty(LEDC_MODE, SERVO_CHANNEL, duty);
-        ledc_update_duty(LEDC_MODE, SERVO_CHANNEL);
+            ledc_set_duty(LEDC_MODE, SERVO_CHANNEL, duty);
+            ledc_update_duty(LEDC_MODE, SERVO_CHANNEL);  
 
-        xSemaphoreGive(servo_step);
+            xSemaphoreGive(servo_to_ultra);
 
-        vTaskDelay(iteration_time / portTICK_PERIOD_MS);
-    }
+            vTaskDelay(iteration_time / portTICK_PERIOD_MS);
+        }
 }
-
-
 
 void sensor_ping_task(void *pvParameters) {
     sensor_ping_task_args_t *args = (sensor_ping_task_args_t *)pvParameters;
@@ -273,8 +271,7 @@ void sensor_ping_task(void *pvParameters) {
     int64_t *time_us = args->time_us;
 
     for (;;) {
-        if (xSemaphoreTake(servo_step, portMAX_DELAY)) {
-            
+        if (xSemaphoreTake(servo_to_ultra, portMAX_DELAY)) {
             gpio_set_level(sensor->trig_pin, 0);
             esp_rom_delay_us(TRIG_LOW_DELAY);
             gpio_set_level(sensor->trig_pin,1);
@@ -283,24 +280,16 @@ void sensor_ping_task(void *pvParameters) {
 
             if (xSemaphoreTake(echo_semaphore, pdMS_TO_TICKS(PING_TIMEOUT))) {
                 int64_t duration = echo_end - echo_start;
-                // add queue logic here for the ultra_to_oled queue, since this is the giver and the oled is the reciever
+                int distance_cm = (int)(duration/58); 
+                // here add queue logic to push the distance and then also add the queue logic to the write_to_oled_task to check against the distance log
             }
         }   
     }
 }
 
-/*
-Outline of what needs to be written to the OLED:
-- the semicirlce, which will be initialized immediately
-- the line which moves with the current step of the servo --> the slope of the line is needed to make it, and since step is related to the duty cycle, we can use the duty 
----> for (x2,y2) : 1966-409 = 1557 / 15 ~= 104 -> there will be 104 different segments of the 0 to 180 degree motion. Therefore if we want to find x2,y2 
---> for the line, (x1,y1) will always be the circle centerpoint. 
-- the dots that will be placed onto the display once movement is detected at at step in the servo sweep cycle
-*/
-
 void write_to_oled_task(void *args) {
     /*
-    
+    and int8_t frame buffer needs to be passed to this task. Maybe rename *args to *frame_buffer or something if naming convention allows it
     */
     printf("Finna write to the oled on dead homies");
 }
@@ -308,29 +297,38 @@ void write_to_oled_task(void *args) {
 // ===================================================================================
 
 // =================================== FUNCTIONS =====================================
-void draw_bresenham_line(int8_t *line_buffer, int x1, int x2, int y1, int y2) {
-    /*
-    For this line --> (x1,y1) would always be the centerpoint. (x2,y2) can be found using cosine {for x2} and sine {for y2}. the degrees per step is 1.04 if step size = 9. 
-    would be kind nice though to make a precomputer lookup table. Do this by running some code in python that generates these x2,y2 pairs and then just paste it into a new array at the top of this file  
-    also cosine and sine read radians in C so use | degrees*pi/180 | to convert to radians
-    */
+void draw_bresenham_line(int8_t *frame_buffer, int x1, int y1, int x2, int y2) {
+    int m_new = 2*(y2-y1);
+    int slope_error_new = m_new - (x2-x1);
+    int page, bit, index;
 
+    for (int x = x1, y = y1; x <= x2; x++) {
+        slope_error_new += m_new;
+        page = y/8;
+        bit = y%8;
+        index = 128*page + x;
+        frame_buffer[index] |= (1 << bit);
+
+        if (slope_error_new >= 0) {
+            y++;
+            slope_error_new -= 2*(x2-x1);
+        }
+    }
 }
 
 void draw_bresenham_semicircle(int8_t *semicircle_buffer) {
     // I only need (-y,-x), (-x,-y), (x,-y), (y, -x) since I 1) only want half the circle 2) the origin (0,0) is at the top left of the screen and the max is at the bottom right so any shape meant to be plotted on a typical graph would be inverted
 
-    int cx = 64, cy = 64; // center will be (64,64)
     int r = 62;
     int x = 0, y = r;
     int d = 3 - 2*r;
     
     while (x <= y) {
         pair_t pairs[4] = {
-            {cx-y,cy-x},
-            {cx-x,cy-y},
-            {cx+x,cy-y},
-            {cx+y,cy-x}
+            {CENTER_X-y,CENTER_Y-x},
+            {CENTER_X-x,CENTER_Y-y},
+            {CENTER_X+x,CENTER_Y-y},
+            {CENTER_X+y,CENTER_Y-x}
         };
 
         for (int i = 0; i<4; i++) {
@@ -353,6 +351,12 @@ void draw_bresenham_semicircle(int8_t *semicircle_buffer) {
         }
         x++;
     }
+}
+
+void draw_pixel(int8_t *frame_buffer) {
+    // inside this function there needs to be the logic to find where the pixel should be placed and then also writing that pixel to the frame_buffer
+
+
 }
 
 void ssd1306_write_page(i2c_port_t i2c_num, uint8_t addr, int page, int col, uint8_t *data, int len) {
@@ -381,28 +385,13 @@ void ssd1306_write_page(i2c_port_t i2c_num, uint8_t addr, int page, int col, uin
 
 // ==================================================================================
 
-/* 
-The three structures used are
-1) servo_step semaphore --> servo steps, pushed an update to the semaphore and the ultrasonic sensor waits for it to ping
-2) echo_semaphore --> and ISR integrated binary semaphore which just acts as an interrupt handle call for when the echo pin goes HIGH. Easier on the CPU than busy cycling until echo goes HIGH.
-3) ultra_to_oled queue --> ultrasonic ping function pushes data to queue,
-You forgot to make the function that keeps track of the previous and current scans and checks whether they match or not. Will also need to write to the oled screen using dots, which should look like:
-  #
-# # #
-  #
-would also be nice to have the dots be written to the oled such that the distance is proportional on the display. So like if one movement detection is seen further away and another is seen closer, they should be at different radii from the center point
-This could probably be done by setting a max distance for movement detection. an initial scan routine for the ultrasonic sensor could set a boundary for disconsideration of changes by using the furthest object within some hard range limit (maybe like 1m or something) and
-scaling the movement flags on the display from that distance, which would be at the maximum of the semicircle ("radar")
-Would also need to wipe the display after displaying the movement for a second or two, maybe a reset at every change in direction for the servo might work. This might mean that changes on the edges of the servo rotation would only be seen for like a second though
-*/
-
 void app_main(void) {
     static int64_t time;
-    int64_t roundtrip_time;
-    int64_t distance = roundtrip_time/58.3;
 
     echo_semaphore = xSemaphoreCreateBinary();
-    servo_step = xSemaphoreCreateBinary();
+    oled_to_servo = xSemaphoreCreateBinary();
+    ultra_to_oled = xQueueCreate(8, sizeof(int));
+    servo_to_ultra = xSemaphoreCreateBinary();
 
     static ultrasonic_sensor_t sensor = {
         .trig_pin = TRIG_PIN,
