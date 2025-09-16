@@ -22,15 +22,19 @@
 #define TRIG_LOW_DELAY 4
 #define TRIG_PIN 5
 #define ECHO_PIN 4
+#define MAX_SCAN_DISTANCE 200 // 200 cm, 2m
+#define CENTER_X 64
+#define CENTER_Y 64
+
 
 #define I2C_NUM I2C_NUM_0
 #define I2C_MASTER_FREQ_HZ 800000
 
+#define PIXEL_LIFETIME_MS 750
+
 #define true 1
 #define false 0
 
-#define CENTER_X 64
-#define CENTER_Y 64
 
 static const char *tag_main = "MAIN";
 static const char *tag_ssd1306 = "SSD1306";
@@ -43,7 +47,7 @@ bool pos_direction = true;
 int step_count = 0;
 const int iteration_time = 8;
 
-const int8_t i2c_address = 0x3C; //address on the oled pcb is 0x78 which translates to 0x3C if you shift all the bits right by one bit
+const uint8_t i2c_address = 0x3C; //address on the oled pcb is 0x78 which translates to 0x3C if you shift all the bits right by one bit
 
 SemaphoreHandle_t servo_to_ultra;
 QueueHandle_t ultra_to_oled;
@@ -55,7 +59,8 @@ static int64_t echo_start = 0;
 static int64_t echo_end = 0;
 
 int64_t distance_history[174];
-int8_t frame_buffer[1024];
+uint8_t frame_buffer[1024];
+uint32_t pixel_expiration[(max_duty-min_duty)/step];
 
 typedef struct {
     gpio_port_t echo_pin;
@@ -246,7 +251,7 @@ void servo_loop_task(void *args) {
 }    
 
 void servo_step_task(void *args) { // will trigger a single step in the servo every time it is called. I think iteration time should be applied in the main loop.
-    if (xSemaphoreTake(oled_to_servo, portMAX_DELAY))
+    if (xSemaphoreTake(oled_to_servo, portMAX_DELAY)) {
         for (;;) {
             if (pos_direction) duty += step;
             else duty -= step;
@@ -264,6 +269,7 @@ void servo_step_task(void *args) { // will trigger a single step in the servo ev
 
             vTaskDelay(iteration_time / portTICK_PERIOD_MS);
         }
+    }
 }
 
 void sensor_ping_task(void *pvParameters) {
@@ -295,11 +301,12 @@ void write_to_oled_task(void *buffer) {
     int distance;
     for (;;) {
         if (xQueueReceive(ultra_to_oled, &distance, portMAX_DELAY)) {
-            draw_bresenham_semicircle(buffer);
+            draw_bresenham_semicircle(buffer); // its either small RAM overhead or even smaller CPU overhead so I chose this rahter than just making one semicircle and copying it constantly
             draw_bresenham_line(buffer, CENTER_X, CENTER_Y, coord_lookup_table[step_count].x, coord_lookup_table[step_count].y);
             if (abs(distance - distance_history[step_count])>4) {
-                printf("do something");
+                draw_pixel(buffer, distance, coord_lookup_table[step_count].x, coord_lookup_table[step_count].y);
             }
+
         }
     }
         
@@ -308,7 +315,8 @@ void write_to_oled_task(void *buffer) {
 // ===================================================================================
 
 // =================================== FUNCTIONS =====================================
-void draw_bresenham_line(int8_t *frame_buffer, int x1, int y1, int *x2_ptr, int *y2_ptr) {
+
+void draw_bresenham_line(uint8_t *frame_buffer, int x1, int y1, int *x2_ptr, int *y2_ptr) {
     int y2 = *y2_ptr;
     int x2 = *x2_ptr;
     int m_new = 2*(y2-y1);
@@ -329,7 +337,7 @@ void draw_bresenham_line(int8_t *frame_buffer, int x1, int y1, int *x2_ptr, int 
     }
 }
 
-void draw_bresenham_semicircle(int8_t *semicircle_buffer) {
+void draw_bresenham_semicircle(uint8_t *semicircle_buffer) {
     // I only need (-y,-x), (-x,-y), (x,-y), (y, -x) since I 1) only want half the circle 2) the origin (0,0) is at the top left of the screen and the max is at the bottom right so any shape meant to be plotted on a typical graph would be inverted
 
     int r = 62;
@@ -348,8 +356,6 @@ void draw_bresenham_semicircle(int8_t *semicircle_buffer) {
             int px = pairs[i].x;
             int py = pairs[i].y;
 
-            if (px<0 || px >= 128 || py < 0 || py >= 64) continue;
-
             int page = py/8;
             int bit = py%8;
             int index = page*128 + px;
@@ -366,10 +372,20 @@ void draw_bresenham_semicircle(int8_t *semicircle_buffer) {
     }
 }
 
-void draw_pixel(int8_t *frame_buffer) {
+void draw_pixel(uint8_t *frame_buffer, int distance, int x2, int y2) {
     // inside this function there needs to be the logic to find where the pixel should be placed and then also writing that pixel to the frame_buffer
+    float pix_radius_scale = distance/MAX_SCAN_DISTANCE; // this should find the position of the distance relative to the max scanning distance. Ex: distance is 50cm; 50/200 = 0.25
+    // now just find the spot that would be 25% along the line to the (x2,y2) from the centerpoint
+    float x_f = CENTER_X + pix_radius_scale*(x2-CENTER_X);
+    float y_f = CENTER_Y + pix_radius_scale*(y2-CENTER_Y);
 
+    int x = (int)x_f;
+    int y = (int)y_f;
 
+    int page = y/8;
+    int bit = y%8;
+    int index = 128*page + x;
+    frame_buffer[index] |= (1 << bit);
 }
 
 void ssd1306_write_page(i2c_port_t i2c_num, uint8_t addr, int page, int col, uint8_t *data, int len) {
