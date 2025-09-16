@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
@@ -48,13 +49,13 @@ SemaphoreHandle_t servo_to_ultra;
 QueueHandle_t ultra_to_oled;
 SemaphoreHandle_t oled_to_servo;
 
-
 // echo signal stuff
 static SemaphoreHandle_t echo_semaphore;
 static int64_t echo_start = 0;
 static int64_t echo_end = 0;
 
 int64_t distance_history[174];
+int8_t frame_buffer[1024];
 
 typedef struct {
     gpio_port_t echo_pin;
@@ -72,7 +73,7 @@ typedef struct {
 } pair_t;
 
 // precomputed lookup table for (x2,y2) pairs
-pair_t coord_lookup_table = {
+pair_t coord_lookup_table[] = {
     {2,64}, {2,63}, {2,62}, {2,61}, {2,60}, {2,58}, {2,57}, {2,56}, {3,55}, {3,54}, {3,53}, 
     {3,52}, {3,51}, {4,50}, {4,48}, {4,47}, {5,46}, {5,45}, {5,44}, {6,43}, {6,42}, {6,41}, 
     {7,40}, {7,39}, {8,38}, {8,37}, {9,36}, {9,35}, {10,34}, {10,33}, {11,32}, {12,31}, 
@@ -281,23 +282,35 @@ void sensor_ping_task(void *pvParameters) {
             if (xSemaphoreTake(echo_semaphore, pdMS_TO_TICKS(PING_TIMEOUT))) {
                 int64_t duration = echo_end - echo_start;
                 int distance_cm = (int)(duration/58); 
-                // here add queue logic to push the distance and then also add the queue logic to the write_to_oled_task to check against the distance log
+                xQueueSend(ultra_to_oled, &distance_cm, portMAX_DELAY);
             }
         }   
     }
 }
 
-void write_to_oled_task(void *args) {
+void write_to_oled_task(void *buffer) {
     /*
     and int8_t frame buffer needs to be passed to this task. Maybe rename *args to *frame_buffer or something if naming convention allows it
     */
-    printf("Finna write to the oled on dead homies");
+    int distance;
+    for (;;) {
+        if (xQueueReceive(ultra_to_oled, &distance, portMAX_DELAY)) {
+            draw_bresenham_semicircle(buffer);
+            draw_bresenham_line(buffer, CENTER_X, CENTER_Y, coord_lookup_table[step_count].x, coord_lookup_table[step_count].y);
+            if (abs(distance - distance_history[step_count])>4) {
+                printf("do something");
+            }
+        }
+    }
+        
 }
 
 // ===================================================================================
 
 // =================================== FUNCTIONS =====================================
-void draw_bresenham_line(int8_t *frame_buffer, int x1, int y1, int x2, int y2) {
+void draw_bresenham_line(int8_t *frame_buffer, int x1, int y1, int *x2_ptr, int *y2_ptr) {
+    int y2 = *y2_ptr;
+    int x2 = *x2_ptr;
     int m_new = 2*(y2-y1);
     int slope_error_new = m_new - (x2-x1);
     int page, bit, index;
@@ -410,4 +423,5 @@ void app_main(void) {
 
     xTaskCreate(&servo_step_task, "servo_step_task", 2048, NULL, 5, NULL);
     xTaskCreate(&sensor_ping_task, "sensor_ping_task", 2048, &args, 5, NULL);
+    xTaskCreate(&write_to_oled_task, "write_to_oled_task", 2048, &frame_buffer, 5, NULL);
 }
