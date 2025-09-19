@@ -437,8 +437,8 @@ void app_main(void) {
     static int64_t time;
 
     echo_semaphore = xSemaphoreCreateBinary();
-    oled_to_servo = xSemaphoreCreateBinary();
     ultra_to_oled = xQueueCreate(8, sizeof(int));
+	oled_to_servo = xSemaphoreCreateBinary();
     servo_to_ultra = xSemaphoreCreateBinary();
 
     static ultrasonic_sensor_t sensor = {
