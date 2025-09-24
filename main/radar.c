@@ -325,9 +325,8 @@ void write_to_oled_task(void *args) {
     // TickType_t prev_refresh = xTaskGetTickCount();
     // const TickType_t refresh = pdMS_TO_TICKS(33);
 
-    memset(frame_buffer, 0x00, sizeof(frame_buffer)); // reset frame_buffer to prepare for new data
-
     for (;;) {
+        memset(frame_buffer, 0x00, sizeof(frame_buffer)); // reset frame_buffer to prepare for new data
         int x2 = coord_lookup_table[step_count].x;
         int y2 = coord_lookup_table[step_count].y;
 
@@ -345,7 +344,7 @@ void write_to_oled_task(void *args) {
         uint32_t now = xTaskGetTickCount();
         for (int step = 0; step < MAX_STEPS; step++) {
             if (pixel_expiration[step] > now) {
-                draw_pixel(buffer, distance, coord_lookup_table[step].x, coord_lookup_table[step].y);
+                draw_pixel(buffer, distance_history[step], coord_lookup_table[step].x, coord_lookup_table[step].y);
             }
         }
 
