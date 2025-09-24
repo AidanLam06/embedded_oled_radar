@@ -469,8 +469,8 @@ void ssd1306_write_page(i2c_port_t i2c_num, uint8_t addr, int page, int col, uin
 
 void app_main(void) {
     echo_semaphore = xSemaphoreCreateBinary();
-    oled_to_servo = xSemaphoreCreateBinary();
     ultra_to_oled = xQueueCreate(8, sizeof(int));
+	oled_to_servo = xSemaphoreCreateBinary();
     servo_to_ultra = xSemaphoreCreateBinary();
 
     static ultrasonic_sensor_t sensor = {
