@@ -1,6 +1,5 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
 #include "freertos/task.h"
@@ -24,21 +23,22 @@
 #define MAX_STEPS ((MAX_DUTY-MIN_DUTY)/STEP)
 
 //ultrasonic
-#define PING_TIMEOUT_MS (6000)
+#define PING_TIMEOUT_US (6000)
+#define SEM_TIMEOUT_MS  (8)
 #define TRIG_HIGH_DELAY (10)
 #define TRIG_LOW_DELAY (4)
 #define TRIG_PIN (5)
 #define ECHO_PIN (4)
 #define MAX_SCAN_DISTANCE (200) // 200 cm, 2m
-#define CENTER_X (64)
-#define CENTER_Y (64)
+#define SOUND_CM_P_US (0.0343) // speed of sound in cm/us (centimeters per microsecond)
 
-//I2C
+//I2C and OLED
 #define I2C_NUM I2C_NUM_0
 #define I2C_MASTER_FREQ_HZ (800000)
 #define SDA_PIN (21)
 #define SCL_PIN (22)
-
+#define CENTER_X (64)
+#define CENTER_Y (64)
 #define PIXEL_LIFETIME_MS (750)
 
 #define DESIRED_LOOP_DURATION_MS 8000 
@@ -61,9 +61,9 @@ QueueHandle_t ultra_to_oled;
 SemaphoreHandle_t oled_to_servo;
 
 // echo signal stuff
-static SemaphoreHandle_t echo_semaphore;
-static int64_t echo_start = 0;
-static int64_t echo_end = 0;
+// static SemaphoreHandle_t echo_semaphore;
+// static int64_t echo_start = 0;
+// static int64_t echo_end = 0;
 
 int64_t distance_history[MAX_STEPS];
 uint8_t frame_buffer[1024];
@@ -108,27 +108,56 @@ pair_t coord_lookup_table[] = {
     {126,62}, {126,63}, {126,64}
 };
 
+// ==================================================================================
+
+// ============================ DEBUGGING CONTENT ===================================
+QueueHandle_t isr_debug_queue;
+
+typedef struct {
+    int l;
+    int64_t the_time;
+} isr_t;
+
+// ==================================================================================
+
 // ====================================== ISR =======================================
 
-// for the echo
+/*
 static void IRAM_ATTR echo_isr_handler(void *args) {
     int level = gpio_get_level(ECHO_PIN);
     int64_t time_now = esp_timer_get_time();
+    
+    // all debugging stuff
+    isr_t level_0 = {
+        .l = level,
+        .the_time = time_now
+    };
+    isr_t level_1;
+    isr_t level_2;
+    // ======
+
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    
+    xQueueSendFromISR(isr_debug_queue, &level_0, &xHigherPriorityTaskWoken); // debug
 
     if (level == 1) {
-        ESP_LOGI(tag, "ISR: echo start");
+        level_1.l = level; //  debug 
         echo_start = time_now;
+        level_1.the_time = echo_start; // debug
+        xQueueSendFromISR(isr_debug_queue, &level_1, &xHigherPriorityTaskWoken); //debug
     }
     else {
-        ESP_LOGI(tag, "ISR: echo stop");
         echo_end = time_now;
-        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        level_2.l = level; // debug
+        level_2.the_time = echo_end; // debug
+        xQueueSendFromISR(isr_debug_queue, &level_2, &xHigherPriorityTaskWoken); // debug
         xSemaphoreGiveFromISR(echo_semaphore, &xHigherPriorityTaskWoken);
         if (xHigherPriorityTaskWoken) {
             portYIELD_FROM_ISR();
         }
     }
 }
+*/
 
 // ==================================================================================
 
@@ -138,6 +167,7 @@ void draw_bresenham_semicircle(uint8_t *buffer);
 void draw_bresenham_line(uint8_t *buffer, int x1, int y1, int x2, int y2);
 void draw_pixel(uint8_t *buffer, int distance, int x2, int y2);
 void ssd1306_write_page(i2c_port_t i2c_num, uint8_t addr, int page, int col, uint8_t *data_buffer, int len);
+float hcsr04_read_dist(void);
 
 // ==================================================================================
 
@@ -182,8 +212,6 @@ static void gpio_setup() {
         .pull_up_en = 0
     };
     gpio_config(&echo_config);
-    gpio_install_isr_service(0);
-    gpio_isr_handler_add(ECHO_PIN, echo_isr_handler, NULL);
 }
 
 static void i2c_master_init(int16_t sda, int16_t scl) {
@@ -263,7 +291,6 @@ void servo_loop_task(void *args) {
 
         if (duty >= max_duty) pos_direction = false;
         if (duty <= min_duty) pos_direction = true;
-
         ledc_set_duty(LEDC_MODE, SERVO_CHANNEL, duty);
         ledc_update_duty(LEDC_MODE, SERVO_CHANNEL);
 
@@ -295,23 +322,19 @@ void servo_step_task(void *args) { // will trigger a single step in the servo ev
 }
 
 void sensor_ping_task(void *args) {
-    ultrasonic_sensor_t *sensor = (ultrasonic_sensor_t*)args;
-
     for (;;) {
         if (xSemaphoreTake(servo_to_ultra, portMAX_DELAY)) {
-            loop_timer.start = esp_timer_get_time(); // start the loop time
             ESP_LOGI(tag, "sensor_ping");
-            gpio_set_level(sensor->trig_pin, 0);
-            esp_rom_delay_us(TRIG_LOW_DELAY);
-            gpio_set_level(sensor->trig_pin,1);
-            esp_rom_delay_us(TRIG_HIGH_DELAY);
-            gpio_set_level(sensor->trig_pin, 0);
 
-            if (xSemaphoreTake(echo_semaphore, pdMS_TO_TICKS(PING_TIMEOUT_MS))) {
-                ESP_LOGI(tag, "echo signal");
-                int64_t duration = echo_end - echo_start;
-                int distance_cm = (int)(duration/58); 
+            float distance = hcsr04_read_dist();
+            if (distance > 0) {
+                int distance_cm = (int)distance;
+                ESP_LOGI(tag, "Distance: %d cm", distance_cm);
                 xQueueSend(ultra_to_oled, &distance_cm, portMAX_DELAY);
+            } else {
+                ESP_LOGW(tag, "Failed to read distance");
+                int distance_err = -1;
+                xQueueSend(ultra_to_oled, &distance_err, portMAX_DELAY);
             }
         }   
     }
@@ -335,6 +358,12 @@ void write_to_oled_task(void *args) {
 
         if (xQueueReceive(ultra_to_oled, &distance, portMAX_DELAY)) {
             ESP_LOGI(tag, "write_to_oled");
+            if (distance < 0) {
+                ESP_LOGE(tag, "Distance value couldn't be read");
+            }
+            if (distance >= MAX_SCAN_DISTANCE) {
+
+            }
             if (llabs(distance - distance_history[step_count]) > 4) {
                 distance_history[step_count] = distance;
                 pixel_expiration[step_count] = xTaskGetTickCount() + pdMS_TO_TICKS(750);
@@ -364,6 +393,33 @@ void startup_ritual_task(void *args) {
     xSemaphoreGive(servo_to_ultra);
     vTaskDelete(NULL);
 }
+
+/*
+void isr_debug_task(void *args) {
+    isr_t receive_data;
+    int count = 0;
+    
+    for (;;) {
+        if (xQueueReceive(isr_debug_queue, &receive_data, portMAX_DELAY)) {
+            switch(count) {
+                case 0:
+                    ESP_LOGI(tag, "ISR UP : level : %d, time : %lld", 
+                             receive_data.l, receive_data.the_time);
+                    break;
+                case 1:
+                    ESP_LOGI(tag, "ISR SAYS HIGH : level : %d, time : %lld", 
+                             receive_data.l, receive_data.the_time);
+                    break;
+                case 2:
+                    ESP_LOGI(tag, "ISR SAYS LOW AND DONE : level : %d, time : %lld", 
+                             receive_data.l, receive_data.the_time);
+                    break;
+            }
+            count = (count + 1) % 3; // Reset after 3 messages, or use count++ for one-time sequence
+        }
+    }
+}
+*/
 
 // ===================================================================================
 
@@ -441,7 +497,8 @@ void draw_pixel(uint8_t *buffer, int distance, int x2, int y2) {
 }
 
 void ssd1306_write_page(i2c_port_t i2c_num, uint8_t addr, int page, int col, uint8_t *data_buffer, int len) {
-    i2c_cmd_handle_t cmd;
+    Need to make a buffer dump using ESP_LOG_BUFFER_HEX() --> prints out 8 bytes or whatever just split that into individual bits and print that as 1s and 0s or something
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create(); // originally was just i2c_handle_t cmd; 
 
     cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
@@ -464,13 +521,55 @@ void ssd1306_write_page(i2c_port_t i2c_num, uint8_t addr, int page, int col, uin
     i2c_cmd_link_delete(cmd);
 }
 
+float hcsr04_read_dist(void) {
+    loop_timer_t echo_timer;
+
+    ESP_LOGI(tag, "hcsr04 reading distance");
+    gpio_set_level(TRIG_PIN, 0);
+    ESP_LOGI(tag, "1 TRIG is : %d", gpio_get_level(TRIG_PIN));
+    esp_rom_delay_us(TRIG_LOW_DELAY);
+    gpio_set_level(TRIG_PIN, 1);
+    ESP_LOGI(tag, "2 TRIG is : %d", gpio_get_level(TRIG_PIN));
+    esp_rom_delay_us(TRIG_HIGH_DELAY);
+    ESP_LOGI(tag, "3 TRIG is : %d", gpio_get_level(TRIG_PIN));
+    gpio_set_level(TRIG_PIN, 0);
+
+    int64_t start_time = esp_timer_get_time();
+    while (gpio_get_level(ECHO_PIN) == 0) {
+        ESP_LOGI(tag, "ECHO is : %d", gpio_get_level(ECHO_PIN));
+        if (esp_timer_get_time() - start_time > PING_TIMEOUT_US) {
+            ESP_LOGW(tag, "Timeout waiting for echo start");
+            return -1.0;
+        }
+    }
+
+    echo_timer.start = esp_timer_get_time();
+    ESP_LOGI(tag, "Timer started");
+
+    while (gpio_get_level(ECHO_PIN) == 1) {
+        ESP_LOGI(tag, "ECHO is : %d", gpio_get_level(ECHO_PIN));
+        if (esp_timer_get_time() - start_time > PING_TIMEOUT_US) {
+            ESP_LOGW(tag, "Timeout waiting for echo end");
+            return -1.0;
+        }
+    }
+
+    echo_timer.end = esp_timer_get_time();
+    ESP_LOGI(tag, "Timer stopped");
+
+    int64_t duration = echo_timer.end - echo_timer.start;
+    float distance = (duration * SOUND_CM_P_US) / 2.0;
+    return distance;
+}
+
 // ==================================================================================
 
 void app_main(void) {
-    echo_semaphore = xSemaphoreCreateBinary();
+    // echo_semaphore = xSemaphoreCreateBinary();
     ultra_to_oled = xQueueCreate(8, sizeof(int));
 	oled_to_servo = xSemaphoreCreateBinary();
     servo_to_ultra = xSemaphoreCreateBinary();
+    // isr_debug_queue = xQueueCreate(16, sizeof(isr_t));
 
     static ultrasonic_sensor_t sensor = {
         .trig_pin = TRIG_PIN,
@@ -481,6 +580,13 @@ void app_main(void) {
     gpio_setup();
 
     ultrasonic_init(&sensor);
+
+    /*
+    ESP_ERROR_CHECK(gpio_install_isr_service(0));
+    esp_err_t isr_result = gpio_isr_handler_add(ECHO_PIN, echo_isr_handler, NULL);
+    ESP_LOGI(tag, "ISR setup result: %s", esp_err_to_name(isr_result));
+    */
+
     i2c_master_init(SDA_PIN, SCL_PIN);
     i2c_init(I2C_NUM, i2c_address);
 
@@ -488,4 +594,5 @@ void app_main(void) {
     xTaskCreate(&sensor_ping_task, "sensor_ping_task", 2048, &sensor, 5, NULL);
     xTaskCreate(&write_to_oled_task, "write_to_oled_task", 2048, &frame_buffer, 5, NULL);
     xTaskCreate(&startup_ritual_task, "startup_ritual_task", 2048, NULL, 5, NULL);
+    // xTaskCreate(&isr_debug_task, "isr_debug_task", 2048, NULL, 5, NULL);
 }
