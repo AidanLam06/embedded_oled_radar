@@ -485,7 +485,7 @@ void draw_pixel(uint8_t *buffer, int distance, int x2, int y2) {
     float pix_radius_scale = (float)distance/(float)MAX_SCAN_DISTANCE; // this should find the position of the distance relative to the max scanning distance. Ex: distance is 50cm; 50/200 = 0.25
     // now just find the spot that would be 25% along the line to the (x2,y2) from the centerpoint
     float x_f = CENTER_X + pix_radius_scale*(x2-CENTER_X);
-    float y_f = CENTER_Y + pix_radius_scale*(CENTER_Y-y2);
+    float y_f = CENTER_Y - pix_radius_scale*(CENTER_Y-y2);
 
     int x = (int)x_f;
     int y = (int)y_f;
